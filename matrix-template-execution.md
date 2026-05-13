@@ -133,25 +133,61 @@ sequenceDiagram
     end
 ```
 
-### status-matrix 시퀀스 (차이점)
+### status-matrix 시퀀스 (전체)
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant B as Browser
+    participant B as Browser (Admin UI)
     participant D as dook server-api
     participant A as ASSA (AWX)
     participant H as Target Host
 
-    B->>D: POST /admin/v1/assa/templates/status-matrix<br/>{hosts, var:"", watchtower_id}
-    D->>A: POST {prefix}/matrix-server:status-matrix
-    A-->>D: 202 {id:3816, name:"MatrixServer_Status_Matrix",<br/>playbook:"status_matrix/main.yaml", status:"pending"}
-    D-->>B: 202 포워딩
+    B->>D: POST /admin/v1/assa/templates/status-matrix<br/>Cookie + {hosts:["serve1..."], var:"", watchtower_id:"1234"}
+    D->>D: c.Params("template") → "status-matrix"<br/>strings.TrimSpace (화이트리스트 검증 없음)
+    D->>D: BodyParser → AssaTemplateExecuteRequest
+    D->>D: ValidateAssaTemplateExecuteRequest()<br/>hosts 비어있지 않은지, webhook_url 파싱
+    D->>D: Vault에서 SERVER_API_ASSA_SECRET_KEY 로드
+    D->>D: json.Marshal(req) → payloadBytes
+    D->>A: POST {AssaTemplateUrlPrefix}matrix-server:status-matrix<br/>Authorization: <ASSA_SECRET_KEY><br/>Content-Type: application/json<br/>Body: {hosts, var:"", job_tags, webhook_url, watchtower_id}
+    A->>A: job 등록 (DB) + 큐잉
+    A-->>D: 202 Accepted<br/>{id:3816,<br/> name:"MatrixServer_Status_Matrix",<br/> playbook:"status_matrix/main.yaml",<br/> status:"pending",<br/> elapsed:0.0,<br/> created:"...", modified:"...",<br/> finished:null,<br/> event_processing_finished:false}
+    D->>D: forwardAssaJsonResponse()<br/>IsSuccessful(202) == true
+    D-->>B: 202 Accepted (응답 본문 그대로 포워딩)
 
-    Note over A,H: install과 동일 경로지만 playbook이 다름
-    A->>H: SSH + ansible-playbook status_matrix/main.yaml<br/>(대체로 read-only 점검)
-    H-->>A: 상태 정보
+    Note over A,H: 비동기 실행 — Job Runner가 큐에서 pick
+    A->>A: Job Template "matrix-server:status-matrix" 로드<br/>+ Machine Credential 주입 (SSH user/key)
+    A->>H: SSH 연결 (ansible_ssh)
+    A->>H: ansible-playbook status_matrix/main.yaml<br/>(설치 여부 / 프로세스 / 버전 / 헬스 체크 등 — read-only)
+    H-->>A: facts / 상태 결과 / stdout
+
+    loop 상태 폴링 (FINAL_STATUSES 도달 또는 event_processing_finished=true까지)
+        B->>D: GET /admin/v1/assa/jobs/3816
+        D->>D: getJobIdFromParam → 3816<br/>Vault에서 ASSA_SECRET_KEY 로드
+        D->>A: GET {AssaJobUrlPrefix}3816<br/>Authorization: <ASSA_SECRET_KEY>
+        A-->>D: 200 {id:3816, status:"running"|"successful"|...,<br/> elapsed, finished, event_processing_finished}
+        D->>D: forwardAssaJsonResponse()
+        D-->>B: 200 포워딩
+
+        B->>D: GET /admin/v1/assa/jobs/3816/stdout
+        D->>A: GET {AssaJobUrlPrefix}3816/stdout
+        A-->>D: 200 text/plain 또는 application/json<br/>PLAY [...] / TASK [...]
+        D->>D: forwardAssaRawResponse() (Content-Type 보존)
+        D-->>B: 200 stdout 포워딩
+    end
+
+    Note over B: FINAL_STATUSES:<br/>successful / failed / error / canceled / cancelled<br/>도달 시 폴링 중단
+
+    opt webhook_url 제공된 경우 (현재 요청은 미설정)
+        A-->>B: (ASSA가 직접) webhook_url로 결과 콜백
+    end
 ```
+
+**install-matrix와의 차이는 다음 두 가지뿐**:
+- `var`: install은 `matrix_phase`, `matrix_api_key`, `matrix_download_from_tenth` 포함 / status는 빈 문자열
+- ASSA가 매핑하는 Job Template과 playbook: `matrix-server:status-matrix` → `status_matrix/main.yaml` (호스트 상태 점검, 일반적으로 read-only)
+
+dook 측 코드 경로는 install/status가 완전히 동일하며, 검증·인증·timeout 부재 등 보안 이슈도 동일하게 적용됨.
 
 ### 두 엔드포인트 차이 요약
 
