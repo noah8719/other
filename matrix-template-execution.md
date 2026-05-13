@@ -97,7 +97,7 @@ flowchart LR
     RUNNER -. "webhook_url 콜백 (옵션)" .-> UI
 ```
 
-### install-matrix 시퀀스
+### install-matrix 시퀀스 (전체)
 
 ```mermaid
 sequenceDiagram
@@ -107,29 +107,45 @@ sequenceDiagram
     participant A as ASSA (AWX)
     participant H as Target Host
 
-    B->>D: POST /admin/v1/assa/templates/install-matrix<br/>Cookie + {hosts, var, watchtower_id}
-    D->>D: ValidateAssaTemplateExecuteRequest()<br/>hosts 비어있지 않은지, webhook_url 파싱
-    D->>D: Vault에서 SERVER_API_ASSA_SECRET_KEY 로드
-    D->>A: POST {prefix}/matrix-server:install-matrix<br/>Authorization: <ASSA_SECRET_KEY>
-    A->>A: job 등록 + 큐잉
-    A-->>D: 202 Accepted<br/>{id:3815, status:"pending",<br/>playbook:"install_matrix/main.yaml"}
-    D-->>B: 202 (그대로 포워딩)
+    B->>D: POST /admin/v1/assa/templates/install-matrix<br/>Cookie + {hosts:["serve1.example.com"],<br/> var:"matrix_phase=prod matrix_download_from_tenth=true",<br/> watchtower_id:"1234"}
+    D->>D: c.Params("template") → "install-matrix"<br/>strings.TrimSpace (화이트리스트 검증 없음)
+    D->>D: BodyParser → AssaTemplateExecuteRequest
+    D->>D: ValidateAssaTemplateExecuteRequest()<br/>• hosts 비어있지 않은지<br/>• 각 host 공백 아닌지<br/>• webhook_url 있으면 url.ParseRequestURI
+    D->>D: Vault에서 SERVER_API_ASSA_SECRET_KEY 로드<br/>(공백이면 500)
+    D->>D: json.Marshal(req) → payloadBytes
+    D->>A: POST {AssaTemplateUrlPrefix}matrix-server:install-matrix<br/>= https://assav2-api.dev.onkakao.net/api/v2/templates/<br/>  matrix-server:install-matrix<br/>Authorization: <ASSA_SECRET_KEY><br/>Accept: application/json<br/>Content-Type: application/json<br/>Body: {hosts, var, job_tags, webhook_url, watchtower_id}
+    A->>A: job 등록 (DB) + 큐잉<br/>Job Template "matrix-server:install-matrix" 매핑
+    A-->>D: 202 Accepted<br/>{id:3815,<br/> type:"job",<br/> name:"MatrixServer_Install_Matrix",<br/> playbook:"install_matrix/main.yaml",<br/> status:"pending",<br/> job_tags:"",<br/> elapsed:0.0,<br/> created:"2026-05-12T04:45:01.123127Z",<br/> modified:"2026-05-12T04:45:01.183734Z",<br/> finished:null,<br/> event_processing_finished:false}
+    D->>D: forwardAssaJsonResponse()<br/>http_util.IsSuccessful(202) == true<br/>Content-Type: application/json 설정
+    D-->>B: 202 Accepted (응답 본문 그대로 포워딩)
 
-    Note over A,H: 비동기 실행 (runner가 큐에서 pick)
-    A->>H: SSH (machine credential)
-    A->>H: ansible playbook: install_matrix/main.yaml
-    H-->>A: stdout / 결과
+    Note over A,H: 비동기 실행 — Job Runner가 큐에서 pick
+    A->>A: Job Template 로드<br/>+ Machine Credential 주입 (SSH user/key, become)<br/>+ extra-vars: matrix_phase=prod,<br/>  matrix_download_from_tenth=true
+    A->>H: SSH 연결 (ansible_ssh, machine credential)
+    A->>H: ansible-playbook install_matrix/main.yaml<br/>(에이전트 다운로드/배포/구성, become 사용 가능)
+    H-->>A: TASK 결과 / changed=N / stdout
+    Note over H: 변경 발생 가능:<br/>"changed: [dkosv3-matrix-...]" 형태
 
-    loop 폴링
+    loop 상태 폴링 (FINAL_STATUSES 또는 event_processing_finished=true까지)
         B->>D: GET /admin/v1/assa/jobs/3815
-        D->>A: GET /api/v2/jobs/3815
-        A-->>D: {status: running | successful}
-        D-->>B: 포워딩
+        D->>D: getJobIdFromParam → 3815<br/>(strconv.Atoi, 음수 거부)
+        D->>D: Vault에서 ASSA_SECRET_KEY 로드
+        D->>A: GET {AssaJobUrlPrefix}3815<br/>= https://assav2-api.dev.onkakao.net/api/v2/jobs/3815<br/>Authorization: <ASSA_SECRET_KEY>
+        A-->>D: 200 {id:3815,<br/> status:"running"|"successful"|"failed"|...,<br/> elapsed, modified, finished,<br/> event_processing_finished}
+        D->>D: forwardAssaJsonResponse()
+        D-->>B: 200 포워딩
 
         B->>D: GET /admin/v1/assa/jobs/3815/stdout
-        D->>A: GET /api/v2/jobs/3815/stdout
-        A-->>D: PLAY/TASK 로그
-        D-->>B: 포워딩
+        D->>A: GET {AssaJobUrlPrefix}3815/stdout<br/>Authorization: <ASSA_SECRET_KEY>
+        A-->>D: 200 text/plain 또는 application/json<br/>PLAY [Install Matrix Server Agent] ...<br/>TASK [common : Install Matrix Server Agent] ...<br/>changed: [serve1.example.com]
+        D->>D: forwardAssaRawResponse()<br/>Content-Type 원본 보존
+        D-->>B: 200 stdout 포워딩
+    end
+
+    Note over B: FINAL_STATUSES:<br/>successful / failed / error / canceled / cancelled<br/>도달 시 프런트에서 폴링 중단
+
+    opt webhook_url 제공된 경우 (현재 요청은 미설정)
+        A-->>B: (ASSA가 직접) webhook_url로 결과 콜백
     end
 ```
 
